@@ -65,8 +65,10 @@ def _rasterize_svg(path: str) -> Image.Image:
     raise ImportError(
         f"Cannot rasterize SVG content at {path}.\n"
         "The icon files contain SVG (vector) data, which Pillow cannot read.\n"
-        "Re-download icons as PNG:  python -m mewgenics_sets scrape --png-icons\n"
-        "or install a renderer:     pip install cairosvg"
+        "Fix (reportlab 5.0 needs its Cairo backend):\n"
+        "    pip install rlPyCairo\n"
+        "Or install an alternative renderer:\n"
+        "    pip install cairosvg"
     )
 
 
