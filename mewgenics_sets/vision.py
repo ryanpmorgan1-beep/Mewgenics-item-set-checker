@@ -28,31 +28,28 @@ except ImportError:  # pragma: no cover
     imagehash = None
 
 
-def _open_icon(path: str) -> Image.Image:
-    """Open an icon file, rasterizing SVG to RGB if needed.
+def _looks_like_svg(head: bytes) -> bool:
+    """True if the first bytes of a file are SVG/XML rather than a raster image."""
+    sniff = head.lstrip()[:512].lower()
+    return sniff.startswith(b"<?xml") or sniff.startswith(b"<svg") or b"<svg" in sniff
 
-    The Mewgenics wiki serves icons as SVGs.  Pillow cannot open SVG files
-    natively; we try two pure-Python renderers in order:
-      1. svglib + reportlab  (pip install svglib reportlab)
-      2. cairosvg            (pip install cairosvg)
 
-    If neither is installed we raise ImportError with install instructions.
+def _rasterize_svg(path: str) -> Image.Image:
+    """Rasterize an SVG file to an RGB image, trying available renderers.
+
+    Raises ImportError (with install hint) if no working renderer is found.
     """
-    if not path.lower().endswith(".svg"):
-        return Image.open(path).convert("RGB")
-
-    # --- attempt 1: svglib (pure Python, easiest on Windows) ---
+    # --- attempt 1: svglib + reportlab (pure Python, easiest on Windows) ---
     try:
         from svglib.svglib import svg2rlg          # type: ignore
         from reportlab.graphics import renderPM    # type: ignore
         drawing = svg2rlg(path)
-        if drawing is not None and drawing.width > 0:
-            pil_img = renderPM.drawToPIL(drawing, dpi=96)
-            return pil_img.convert("RGB")
+        if drawing is not None and getattr(drawing, "width", 0) > 0:
+            return renderPM.drawToPIL(drawing, dpi=96).convert("RGB")
     except ImportError:
         pass
     except Exception:
-        pass  # malformed SVG — fall through
+        pass  # malformed SVG / renderer incompatibility — fall through
 
     # --- attempt 2: cairosvg ---
     try:
@@ -66,11 +63,24 @@ def _open_icon(path: str) -> Image.Image:
         pass
 
     raise ImportError(
-        f"Cannot rasterize SVG icon at {path}.\n"
-        "Install one of:\n"
-        "  pip install svglib reportlab\n"
-        "  pip install cairosvg"
+        f"Cannot rasterize SVG content at {path}.\n"
+        "The icon files contain SVG (vector) data, which Pillow cannot read.\n"
+        "Re-download icons as PNG:  python -m mewgenics_sets scrape --png-icons\n"
+        "or install a renderer:     pip install cairosvg"
     )
+
+
+def _open_icon(path: str) -> Image.Image:
+    """Open an icon file as an RGB image, detecting SVG by *content* not name.
+
+    The wiki sometimes hands back SVG bytes even for a ``.png`` URL, so we
+    sniff the file header instead of trusting the extension.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(512)
+    if _looks_like_svg(head):
+        return _rasterize_svg(path)
+    return Image.open(path).convert("RGB")
 
 try:
     import cv2
@@ -185,23 +195,56 @@ class Reference:
 
 
 def build_references(catalog: Catalog) -> list[Reference]:
+    import os
+
     refs: list[Reference] = []
     svg_warn_shown = False
+
+    n_total = len(catalog.items)
+    n_no_path = 0          # item has no icon_path recorded in the catalog
+    n_missing_file = 0     # icon_path set but file not on disk
+    n_svg_unrenderable = 0 # file is SVG and no renderer worked
+    n_open_failed = 0      # some other open/decode error
+    sample_failures: list[str] = []
+
     for it in catalog.items:
         if not it.icon_path:
+            n_no_path += 1
+            continue
+        if not os.path.exists(it.icon_path):
+            n_missing_file += 1
+            if len(sample_failures) < 5:
+                sample_failures.append(f"missing file: {it.icon_path}")
             continue
         try:
             icon = _open_icon(it.icon_path)
         except ImportError as exc:
+            n_svg_unrenderable += 1
             if not svg_warn_shown:
                 print(f"\nWARNING: {exc}\n")
                 svg_warn_shown = True
             continue
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            n_open_failed += 1
+            if len(sample_failures) < 5:
+                sample_failures.append(f"{type(exc).__name__} on {it.icon_path}: {exc}")
             continue
         norm = _normalize(icon, inset=0.04)
         ph = imagehash.phash(norm) if imagehash else None
         refs.append(Reference(item=it, phash=ph, vec=_to_vec(norm)))
+
+    if not refs:
+        print("\nNo usable icon references were built. Breakdown:")
+        print(f"  items in catalog ............ {n_total}")
+        print(f"  with no icon_path ........... {n_no_path}")
+        print(f"  icon file missing on disk ... {n_missing_file}")
+        print(f"  SVG (no renderer) ........... {n_svg_unrenderable}")
+        print(f"  other open/decode failures .. {n_open_failed}")
+        for line in sample_failures:
+            print(f"    - {line}")
+        if n_svg_unrenderable:
+            print("\n  Fix: re-download icons as PNG ->  "
+                  "python -m mewgenics_sets scrape --png-icons")
     return refs
 
 

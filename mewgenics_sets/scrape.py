@@ -23,7 +23,7 @@ import re
 import time
 from dataclasses import asdict
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -333,6 +333,26 @@ def _batch_png_thumbnail_urls(
     return result
 
 
+def _source_file_from_image_url(url: str) -> str:
+    """Recover the underlying wiki File name from an <img> URL.
+
+    MediaWiki renders SVG icons to PNG thumbnails, so the URL we scrape often
+    looks like
+        /images/thumb/a/ab/Peace_Symbol.svg/40px-Peace_Symbol.svg.png
+    whose *source* file is ``Peace_Symbol.svg`` (the segment before the final
+    size-prefixed thumbnail name). A non-thumbnail URL like
+        /images/a/ab/Peace_Symbol.svg
+    has the source file as its last path segment.
+    """
+    path = url.split("?")[0].rstrip("/")
+    segments = path.split("/")
+    if "/thumb/" in path or "thumb" in segments:
+        # original filename is the segment just before the final thumb name
+        if len(segments) >= 2:
+            return unquote(segments[-2])
+    return unquote(segments[-1]) if segments else ""
+
+
 def download_icons(
     catalog: Catalog,
     data_dir: str,
@@ -342,20 +362,27 @@ def download_icons(
 ) -> None:
     """Download item icons.
 
-    png_mode=False (default): download whatever URL is in icon_url (often SVG).
-    png_mode=True: use the MediaWiki thumbnail API to get 64px PNG renders of
-                   SVG icons — no local SVG-rasterization library needed.
+    png_mode=False (default): download whatever URL is in icon_url (often the
+                   wiki's own PNG thumbnail of an SVG, but occasionally raw SVG).
+    png_mode=True: for every icon whose *source* file is an SVG, ask the
+                   MediaWiki thumbnail API for a guaranteed-raster PNG render —
+                   no local SVG-rasterization library needed.
     """
     icon_dir = os.path.join(data_dir, ICON_DIR)
     os.makedirs(icon_dir, exist_ok=True)
 
     if png_mode:
-        # Collect SVG filenames that need a PNG thumbnail URL.
-        svg_items = [
-            it for it in catalog.items
-            if it.icon_url and it.icon_url.lower().endswith(".svg")
-        ]
-        svg_fnames = [it.icon_url.rstrip("/").split("/")[-1] for it in svg_items]
+        # Detect the SOURCE file behind each icon URL (the img src is usually a
+        # ".png" thumbnail even when the underlying file is ".svg").
+        svg_items = []
+        svg_fnames = []
+        for it in catalog.items:
+            if not it.icon_url:
+                continue
+            src = _source_file_from_image_url(it.icon_url)
+            if src.lower().endswith(".svg"):
+                svg_items.append(it)
+                svg_fnames.append(src)
         unique_fnames = list(dict.fromkeys(svg_fnames))   # deduplicate, preserve order
         print(f"  fetching PNG thumbnail URLs for {len(unique_fnames)} SVG icons ...")
         thumb_map = _batch_png_thumbnail_urls(unique_fnames, session)
