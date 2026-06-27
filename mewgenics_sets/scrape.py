@@ -292,15 +292,85 @@ def parse_sets(soup: BeautifulSoup) -> dict[str, SetInfo]:
 # --------------------------------------------------------------------------- #
 # Icons
 # --------------------------------------------------------------------------- #
-def download_icons(catalog: Catalog, data_dir: str, session: requests.Session,
-                   sleep: float = 0.1) -> None:
+def _batch_png_thumbnail_urls(
+    svg_filenames: list[str],
+    session: requests.Session,
+    width: int = 64,
+) -> dict[str, str]:
+    """Query MediaWiki in batches of 50 to get PNG thumbnail URLs for SVG files.
+
+    Returns {svg_filename: png_thumb_url}, e.g. {"Peace_Symbol.svg": "https://..."}.
+    """
+    result: dict[str, str] = {}
+    for i in range(0, len(svg_filenames), 50):
+        batch = svg_filenames[i : i + 50]
+        titles = "|".join(f"File:{f}" for f in batch)
+        try:
+            r = session.get(
+                API,
+                params={
+                    "action": "query",
+                    "prop": "imageinfo",
+                    "iiprop": "url",
+                    "iiurlwidth": str(width),
+                    "titles": titles,
+                    "format": "json",
+                },
+                headers=HEADERS,
+                timeout=30,
+            )
+            r.raise_for_status()
+            pages = r.json().get("query", {}).get("pages", {})
+            for pg in pages.values():
+                title = pg.get("title", "")          # "File:Peace_Symbol.svg"
+                fname = title.replace("File:", "", 1)
+                info = (pg.get("imageinfo") or [{}])[0]
+                url = info.get("thumburl", "")
+                if url:
+                    result[fname] = _abs_url(url)
+        except requests.RequestException as exc:
+            print(f"  ! batch thumbnail query failed: {exc}")
+    return result
+
+
+def download_icons(
+    catalog: Catalog,
+    data_dir: str,
+    session: requests.Session,
+    png_mode: bool = False,
+    sleep: float = 0.05,
+) -> None:
+    """Download item icons.
+
+    png_mode=False (default): download whatever URL is in icon_url (often SVG).
+    png_mode=True: use the MediaWiki thumbnail API to get 64px PNG renders of
+                   SVG icons — no local SVG-rasterization library needed.
+    """
     icon_dir = os.path.join(data_dir, ICON_DIR)
     os.makedirs(icon_dir, exist_ok=True)
+
+    if png_mode:
+        # Collect SVG filenames that need a PNG thumbnail URL.
+        svg_items = [
+            it for it in catalog.items
+            if it.icon_url and it.icon_url.lower().endswith(".svg")
+        ]
+        svg_fnames = [it.icon_url.rstrip("/").split("/")[-1] for it in svg_items]
+        unique_fnames = list(dict.fromkeys(svg_fnames))   # deduplicate, preserve order
+        print(f"  fetching PNG thumbnail URLs for {len(unique_fnames)} SVG icons ...")
+        thumb_map = _batch_png_thumbnail_urls(unique_fnames, session)
+        # Attach resolved PNG urls back to items.
+        for it, fname in zip(svg_items, svg_fnames):
+            if fname in thumb_map:
+                it.icon_url = thumb_map[fname]
+        print(f"  resolved {len(thumb_map)}/{len(unique_fnames)} thumbnail URLs")
+
+    ok = 0
     for it in catalog.items:
         if not it.icon_url:
             continue
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", it.name).strip("_") or "item"
-        ext = os.path.splitext(it.icon_url.split("?")[0])[1] or ".png"
+        ext = ".png" if png_mode else (os.path.splitext(it.icon_url.split("?")[0])[1] or ".png")
         path = os.path.join(icon_dir, f"{safe}{ext}")
         if not os.path.exists(path):
             try:
@@ -308,17 +378,24 @@ def download_icons(catalog: Catalog, data_dir: str, session: requests.Session,
                 r.raise_for_status()
                 with open(path, "wb") as fh:
                     fh.write(r.content)
+                ok += 1
                 time.sleep(sleep)
-            except requests.RequestException as exc:  # pragma: no cover - network
-                print(f"  ! failed to download icon for {it.name}: {exc}")
+            except requests.RequestException as exc:
+                print(f"  ! failed icon for {it.name}: {exc}")
                 continue
         it.icon_path = path
+    if ok:
+        print(f"  downloaded {ok} new icon files")
 
 
 # --------------------------------------------------------------------------- #
 # Public entry points
 # --------------------------------------------------------------------------- #
-def scrape(data_dir: str = DEFAULT_DATA_DIR, with_icons: bool = True) -> Catalog:
+def scrape(
+    data_dir: str = DEFAULT_DATA_DIR,
+    with_icons: bool = True,
+    png_icons: bool = False,
+) -> Catalog:
     os.makedirs(data_dir, exist_ok=True)
     session = requests.Session()
 
@@ -342,7 +419,7 @@ def scrape(data_dir: str = DEFAULT_DATA_DIR, with_icons: bool = True) -> Catalog
 
     if with_icons:
         print("Downloading icons ...")
-        download_icons(catalog, data_dir, session)
+        download_icons(catalog, data_dir, session, png_mode=png_icons)
 
     save_catalog(catalog, data_dir)
     return catalog

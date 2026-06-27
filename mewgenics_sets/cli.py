@@ -25,7 +25,8 @@ from .solver import solve
 
 
 def cmd_scrape(args: argparse.Namespace) -> int:
-    scrape_mod.scrape(data_dir=args.data_dir, with_icons=not args.no_icons)
+    scrape_mod.scrape(data_dir=args.data_dir, with_icons=not args.no_icons,
+                      png_icons=args.png_icons)
     return 0
 
 
@@ -103,6 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("scrape", help="fetch + cache the wiki catalog and icons")
     s.add_argument("--no-icons", action="store_true", help="skip downloading icons")
+    s.add_argument("--png-icons", action="store_true",
+                   help="download icons as PNG (via MediaWiki thumbnail API) instead of SVG")
     s.set_defaults(func=cmd_scrape)
 
     a = sub.add_parser("analyze", help="analyze a screenshot and build the report")
