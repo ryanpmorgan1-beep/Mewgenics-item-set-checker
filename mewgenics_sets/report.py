@@ -100,18 +100,37 @@ _TEMPLATE = r"""<!DOCTYPE html>
            position:sticky; top:0; background:var(--bg); z-index:5; }
   h1 { margin:0 0 4px; font-size:20px; }
   .sub { color:var(--muted); font-size:13px; }
-  .wrap { display:grid; grid-template-columns: 360px 1fr; gap:20px; padding:20px; }
+  .wrap { display:grid; grid-template-columns: 400px 1fr; gap:20px; padding:20px; }
   @media (max-width: 900px){ .wrap{ grid-template-columns:1fr; } }
   .panel { background:var(--panel); border:1px solid var(--line);
            border-radius:10px; padding:14px; }
   h2 { font-size:15px; margin:0 0 10px; color:var(--muted);
        text-transform:uppercase; letter-spacing:.05em; }
-  .cell { display:flex; gap:10px; align-items:center; padding:6px 4px;
+
+  /* ---- cell row ---- */
+  .cell { display:flex; gap:8px; align-items:center; padding:6px 4px;
           border-bottom:1px solid var(--line); }
-  .cell img.crop { width:46px; height:46px; border-radius:6px;
+  .cell img.crop { width:46px; height:46px; flex-shrink:0; border-radius:6px;
                    background:#111; object-fit:contain; }
-  .cell select { flex:1; background:#1b1e22; color:var(--text);
-                 border:1px solid var(--line); border-radius:6px; padding:5px; }
+  .cell img.ref  { width:30px; height:30px; flex-shrink:0; border-radius:4px;
+                   background:#111; object-fit:contain; opacity:.75; }
+
+  /* ---- searchable combobox ---- */
+  .combo-wrap { position:relative; flex:1; }
+  .combo-input { width:100%; background:#1b1e22; color:var(--text);
+                 border:1px solid var(--line); border-radius:6px;
+                 padding:5px 8px; font-size:14px; outline:none; }
+  .combo-input:focus { border-color:var(--accent); }
+  .combo-drop { position:absolute; z-index:99; left:0; right:0; top:100%;
+                background:#1b1e22; border:1px solid var(--accent);
+                border-top:none; border-radius:0 0 6px 6px;
+                max-height:260px; overflow-y:auto; display:none; }
+  .combo-opt { padding:5px 8px; cursor:pointer; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .combo-opt:hover, .combo-opt.focused { background:var(--accent); color:#000; }
+  .combo-opt.hi { color:#d8b063; }
+  .combo-opt.none { color:var(--muted); font-style:italic; cursor:default; }
+
+  /* ---- set bonuses panel ---- */
   .setlist { display:flex; flex-direction:column; gap:12px; }
   .set { border:1px solid var(--line); border-radius:10px; padding:12px;
          background:#21252b; }
@@ -130,14 +149,14 @@ _TEMPLATE = r"""<!DOCTYPE html>
   .piece .slot { color:var(--muted); font-size:11px; }
   .note { color:var(--muted); font-size:12px; margin-top:6px; }
   .controls { margin-bottom:10px; display:flex; gap:8px; align-items:center; }
-  .controls input { width:18px; height:18px; }
+  .controls input[type=checkbox] { width:18px; height:18px; }
   .empty-msg { color:var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>__TITLE__</h1>
-  <div class="sub">Confirm each detected item on the left; achievable set
+  <div class="sub">Type to search for an item name on the left; achievable set
     bonuses update on the right. A set needs __SETSIZE__ items across distinct
     equipment slots.</div>
 </header>
@@ -167,6 +186,123 @@ const selection = {};   // cellId -> item name ("" = none)
 
 function allItemNames() { return Object.keys(ITEMS).sort(); }
 
+// ------------------------------------------------------------------ //
+// Searchable combobox
+// ------------------------------------------------------------------ //
+function buildCombobox(cell, allNames) {
+  const wrap = document.createElement('div');
+  wrap.className = 'combo-wrap';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'combo-input';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+
+  const drop = document.createElement('div');
+  drop.className = 'combo-drop';
+
+  // candidates = [{name, label, hi}]
+  const candidates = cell.candidates.map(c => ({
+    name: c.name,
+    label: c.name + '  (' + Math.round(c.score * 100) + '%)',
+    hi: true,
+  }));
+  const candidateNames = new Set(candidates.map(c => c.name));
+  const rest = allNames
+    .filter(n => !candidateNames.has(n))
+    .map(n => ({ name: n, label: n, hi: false }));
+  const allOpts = [
+    { name: '', label: '— none / empty —', hi: false },
+    ...candidates,
+    ...rest,
+  ];
+
+  const best = cell.candidates[0] ? cell.candidates[0].name : '';
+  input.value = best;
+  selection[cell.id] = best;
+
+  let focusIdx = -1;
+
+  function renderDrop(query) {
+    const q = query.toLowerCase();
+    const filtered = q
+      ? allOpts.filter(o => o.label.toLowerCase().includes(q))
+      : allOpts;
+    drop.innerHTML = '';
+    focusIdx = -1;
+    if (filtered.length === 0) {
+      const d = document.createElement('div');
+      d.className = 'combo-opt none'; d.textContent = 'No matches';
+      drop.appendChild(d);
+      return;
+    }
+    filtered.slice(0, 80).forEach((opt, i) => {
+      const d = document.createElement('div');
+      d.className = 'combo-opt' + (opt.hi ? ' hi' : '');
+      d.textContent = opt.label;
+      d.addEventListener('mousedown', e => {
+        e.preventDefault();
+        commit(opt.name);
+      });
+      drop.appendChild(d);
+    });
+  }
+
+  function openDrop() {
+    renderDrop(input.value);
+    drop.style.display = 'block';
+  }
+  function closeDrop() { drop.style.display = 'none'; }
+
+  function commit(name) {
+    input.value = name;
+    selection[cell.id] = name;
+    closeDrop();
+    recompute();
+    // update reference icon
+    const refImg = wrap.parentElement.querySelector('img.ref');
+    if (refImg) {
+      const ic = ITEMS[name] ? ITEMS[name].icon : '';
+      refImg.src = ic; refImg.style.display = ic ? '' : 'none';
+    }
+  }
+
+  input.addEventListener('focus', openDrop);
+  input.addEventListener('click', openDrop);
+  input.addEventListener('input', () => renderDrop(input.value));
+  input.addEventListener('blur', () => setTimeout(closeDrop, 160));
+
+  input.addEventListener('keydown', e => {
+    const opts = drop.querySelectorAll('.combo-opt:not(.none)');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      focusIdx = Math.min(focusIdx + 1, opts.length - 1);
+      opts.forEach((o, i) => o.classList.toggle('focused', i === focusIdx));
+      if (opts[focusIdx]) opts[focusIdx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      focusIdx = Math.max(focusIdx - 1, 0);
+      opts.forEach((o, i) => o.classList.toggle('focused', i === focusIdx));
+      if (opts[focusIdx]) opts[focusIdx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (focusIdx >= 0 && opts[focusIdx]) {
+        // Find opt data by label text
+        const label = opts[focusIdx].textContent;
+        const found = allOpts.find(o => o.label === label);
+        if (found) commit(found.name);
+      }
+    } else if (e.key === 'Escape') {
+      closeDrop();
+    }
+  });
+
+  wrap.appendChild(input);
+  wrap.appendChild(drop);
+  return wrap;
+}
+
 function buildCells() {
   const root = document.getElementById('cells');
   document.getElementById('cellcount').textContent = '(' + CELLS.length + ')';
@@ -174,39 +310,23 @@ function buildCells() {
   CELLS.forEach(cell => {
     const row = document.createElement('div');
     row.className = 'cell';
-    const img = document.createElement('img');
-    img.className = 'crop'; img.src = cell.crop; img.alt = '';
-    const sel = document.createElement('select');
 
-    const none = document.createElement('option');
-    none.value = ''; none.textContent = '— none / empty —';
-    sel.appendChild(none);
+    // Game screenshot crop
+    const cropImg = document.createElement('img');
+    cropImg.className = 'crop'; cropImg.src = cell.crop; cropImg.alt = '';
+    row.appendChild(cropImg);
 
-    // Top candidates first (with score), then a divider, then everything.
-    cell.candidates.forEach(c => {
-      const o = document.createElement('option');
-      o.value = c.name;
-      o.textContent = c.name + '  (' + Math.round(c.score*100) + '%)';
-      sel.appendChild(o);
-    });
-    const div = document.createElement('option');
-    div.disabled = true; div.textContent = '──────────';
-    sel.appendChild(div);
-    names.forEach(n => {
-      const o = document.createElement('option');
-      o.value = n; o.textContent = n;
-      sel.appendChild(o);
-    });
+    // Wiki reference icon for current selection (updates on change)
+    const refImg = document.createElement('img');
+    refImg.className = 'ref'; refImg.alt = 'ref';
+    const bestName = cell.candidates[0] ? cell.candidates[0].name : '';
+    const bestIcon = bestName && ITEMS[bestName] ? ITEMS[bestName].icon : '';
+    refImg.src = bestIcon;
+    refImg.style.display = bestIcon ? '' : 'none';
+    refImg.title = 'Wiki icon for selected item';
+    row.appendChild(refImg);
 
-    const best = cell.candidates[0] ? cell.candidates[0].name : '';
-    sel.value = best;
-    selection[cell.id] = best;
-    sel.addEventListener('change', () => {
-      selection[cell.id] = sel.value;
-      recompute();
-    });
-
-    row.appendChild(img); row.appendChild(sel);
+    row.appendChild(buildCombobox(cell, names));
     root.appendChild(row);
   });
 }
