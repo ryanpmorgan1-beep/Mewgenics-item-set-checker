@@ -387,10 +387,17 @@ def download_icons(
         print(f"  fetching PNG thumbnail URLs for {len(unique_fnames)} SVG icons ...")
         thumb_map = _batch_png_thumbnail_urls(unique_fnames, session)
         # Attach resolved PNG urls back to items.
+        still_svg = 0
         for it, fname in zip(svg_items, svg_fnames):
             if fname in thumb_map:
-                it.icon_url = thumb_map[fname]
+                url = thumb_map[fname]
+                it.icon_url = url
+                if url.lower().endswith(".svg"):
+                    still_svg += 1
         print(f"  resolved {len(thumb_map)}/{len(unique_fnames)} thumbnail URLs")
+        if still_svg:
+            print(f"  WARNING: {still_svg} resolved URLs are still SVGs — "
+                  "wiki thumbnail API may not be rasterizing them")
 
     ok = 0
     for it in catalog.items:
@@ -399,7 +406,9 @@ def download_icons(
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", it.name).strip("_") or "item"
         ext = ".png" if png_mode else (os.path.splitext(it.icon_url.split("?")[0])[1] or ".png")
         path = os.path.join(icon_dir, f"{safe}{ext}")
-        if not os.path.exists(path):
+        # In png_mode we force re-download: a previous run may have saved SVG bytes
+        # under this name (because the old logic didn't detect SVG-backed icons).
+        if png_mode or not os.path.exists(path):
             try:
                 r = session.get(it.icon_url, headers=HEADERS, timeout=30)
                 r.raise_for_status()
