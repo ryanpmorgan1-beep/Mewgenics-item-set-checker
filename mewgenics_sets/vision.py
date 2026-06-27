@@ -27,6 +27,51 @@ try:
 except ImportError:  # pragma: no cover
     imagehash = None
 
+
+def _open_icon(path: str) -> Image.Image:
+    """Open an icon file, rasterizing SVG to RGB if needed.
+
+    The Mewgenics wiki serves icons as SVGs.  Pillow cannot open SVG files
+    natively; we try two pure-Python renderers in order:
+      1. svglib + reportlab  (pip install svglib reportlab)
+      2. cairosvg            (pip install cairosvg)
+
+    If neither is installed we raise ImportError with install instructions.
+    """
+    if not path.lower().endswith(".svg"):
+        return Image.open(path).convert("RGB")
+
+    # --- attempt 1: svglib (pure Python, easiest on Windows) ---
+    try:
+        from svglib.svglib import svg2rlg          # type: ignore
+        from reportlab.graphics import renderPM    # type: ignore
+        drawing = svg2rlg(path)
+        if drawing is not None and drawing.width > 0:
+            pil_img = renderPM.drawToPIL(drawing, dpi=96)
+            return pil_img.convert("RGB")
+    except ImportError:
+        pass
+    except Exception:
+        pass  # malformed SVG — fall through
+
+    # --- attempt 2: cairosvg ---
+    try:
+        import cairosvg                            # type: ignore
+        from io import BytesIO
+        png = cairosvg.svg2png(url=path, output_width=64, output_height=64)
+        return Image.open(BytesIO(png)).convert("RGB")
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    raise ImportError(
+        f"Cannot rasterize SVG icon at {path}.\n"
+        "Install one of:\n"
+        "  pip install svglib reportlab\n"
+        "  pip install cairosvg"
+    )
+
 try:
     import cv2
 except ImportError:  # pragma: no cover
@@ -141,11 +186,17 @@ class Reference:
 
 def build_references(catalog: Catalog) -> list[Reference]:
     refs: list[Reference] = []
+    svg_warn_shown = False
     for it in catalog.items:
         if not it.icon_path:
             continue
         try:
-            icon = Image.open(it.icon_path)
+            icon = _open_icon(it.icon_path)
+        except ImportError as exc:
+            if not svg_warn_shown:
+                print(f"\nWARNING: {exc}\n")
+                svg_warn_shown = True
+            continue
         except (OSError, ValueError):
             continue
         norm = _normalize(icon, inset=0.04)

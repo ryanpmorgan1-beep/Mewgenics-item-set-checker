@@ -4,6 +4,10 @@ lxml>=4.9
 Pillow>=10.0
 numpy>=1.24
 imagehash>=4.3
+# SVG rasterization — the wiki serves icons as SVG files.
+# svglib+reportlab is pure Python and works on Windows without system deps.
+svglib>=1.5
+reportlab>=4.0
 # Optional, only needed for automatic grid detection in vision.py.
 # The tool degrades gracefully (manual --grid) if this is missing.
 opencv-python-headless>=4.8
