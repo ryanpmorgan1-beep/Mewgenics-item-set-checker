@@ -91,7 +91,7 @@ except ImportError:  # pragma: no cover
 
 from .models import Catalog, Item
 
-NORM_SIZE = 64          # everything is compared at 64x64 grayscale
+NORM_SIZE = 96          # reference and cell images are compared at 96x96 grayscale
 EMPTY_STD_THRESHOLD = 12.0   # cells flatter than this are treated as empty slots
 
 
@@ -189,11 +189,26 @@ def _to_vec(img: Image.Image) -> np.ndarray:
     return a / n if n > 0 else a
 
 
+def _to_edge_vec(img: Image.Image) -> np.ndarray:
+    """Sobel-like edge map as a normalized flat vector.
+
+    Edges are invariant to overall brightness/color tinting, so they give
+    a cleaner shape signature when comparing wiki SVG art (white bg) against
+    in-game sprite crops (grey bg, green tint).
+    """
+    from PIL import ImageFilter
+    edges = img.filter(ImageFilter.FIND_EDGES)
+    a = np.asarray(edges, dtype=np.float32).ravel()
+    n = np.linalg.norm(a)
+    return a / n if n > 0 else a
+
+
 @dataclass
 class Reference:
     item: Item
     phash: object
     vec: np.ndarray
+    edge_vec: np.ndarray
 
 
 def build_references(catalog: Catalog) -> list[Reference]:
@@ -231,9 +246,10 @@ def build_references(catalog: Catalog) -> list[Reference]:
             if len(sample_failures) < 5:
                 sample_failures.append(f"{type(exc).__name__} on {it.icon_path}: {exc}")
             continue
-        norm = _normalize(icon, inset=0.04)
+        norm = _normalize(icon, inset=0.08)
         ph = imagehash.phash(norm) if imagehash else None
-        refs.append(Reference(item=it, phash=ph, vec=_to_vec(norm)))
+        refs.append(Reference(item=it, phash=ph, vec=_to_vec(norm),
+                              edge_vec=_to_edge_vec(norm)))
 
     if not refs:
         print("\nNo usable icon references were built. Breakdown:")
@@ -266,22 +282,29 @@ class CellMatch:
     candidates: list[Candidate] = field(default_factory=list)
 
 
-def _score(cell_norm: Image.Image, cell_vec: np.ndarray, ref: Reference) -> float:
-    # Template correlation in [-1, 1] -> [0, 1].
-    corr = float(np.dot(cell_vec, ref.vec))
-    corr01 = (corr + 1.0) / 2.0
+def _score(
+    cell_norm: Image.Image,
+    cell_vec: np.ndarray,
+    cell_edge_vec: np.ndarray,
+    ref: Reference,
+) -> float:
+    # Pixel correlation [-1,1] → [0,1]
+    corr01 = (float(np.dot(cell_vec, ref.vec)) + 1.0) / 2.0
+    # Edge correlation — colour/tint invariant shape similarity
+    edge01 = (float(np.dot(cell_edge_vec, ref.edge_vec)) + 1.0) / 2.0
     if ref.phash is not None and imagehash is not None:
         ph = imagehash.phash(cell_norm)
-        dist = ph - ref.phash            # 0..64 hamming
-        ph01 = 1.0 - (dist / 64.0)
-        return 0.5 * corr01 + 0.5 * ph01
-    return corr01
+        ph01 = 1.0 - ((ph - ref.phash) / 64.0)
+        # Edge gets highest weight: it's the most robust across art-style gap
+        return 0.15 * corr01 + 0.50 * edge01 + 0.35 * ph01
+    return 0.4 * corr01 + 0.6 * edge01
 
 
 def match_cell(crop: Image.Image, refs: list[Reference], top_k: int = 3) -> list[Candidate]:
     norm = _normalize(crop)
     vec = _to_vec(norm)
-    scored = [Candidate(item=r.item, score=_score(norm, vec, r)) for r in refs]
+    edge_vec = _to_edge_vec(norm)
+    scored = [Candidate(item=r.item, score=_score(norm, vec, edge_vec, r)) for r in refs]
     scored.sort(key=lambda c: c.score, reverse=True)
     return scored[:top_k]
 

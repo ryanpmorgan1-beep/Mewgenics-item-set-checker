@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--grid", help="storage grid bounding box 'x,y,w,h' (pixels)")
     a.add_argument("--rows", type=int, default=11, help="grid rows (default: 11)")
     a.add_argument("--cols", type=int, default=11, help="grid columns (default: 11)")
-    a.add_argument("--top-k", type=int, default=3, help="candidates per cell (default: 3)")
+    a.add_argument("--top-k", type=int, default=5, help="candidates per cell (default: 5)")
     a.add_argument("--out", default="report.html", help="output HTML path")
     a.add_argument("--open", action="store_true", help="open the report in a browser")
     a.set_defaults(func=cmd_analyze)
