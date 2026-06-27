@@ -124,57 +124,87 @@ def _find_col(headers: dict[str, int], *needles: str) -> Optional[int]:
 
 
 def parse_items(soup: BeautifulSoup) -> list[Item]:
-    """Parse the Items page table into Item records (column-order agnostic)."""
+    """Parse the Items page into Item records.
+
+    The real table has class 'shuffle__items' and headers:
+        ['Name', 'Slot', 'Rarity', 'Cursed?', 'Description', 'Uses', 'Item Set']
+    Each data row has ONE extra leading cell (the icon image) that is NOT
+    represented in the header row, so every header index must be shifted by +1
+    when reading a data row.
+    """
+    # Target the specific items table; fall back to the largest wikitable.
+    table = soup.find("table", class_="shuffle__items")
+    if not table:
+        tables = soup.select("table.wikitable")
+        table = max(tables, key=lambda t: len(t.find_all("tr")), default=None)
+    if not table:
+        return []
+
+    rows = table.find_all("tr")
+    if not rows:
+        return []
+
+    header_cells = rows[0].find_all(["th", "td"])
+    n_headers = len(header_cells)
+    hmap = {c.get_text(" ", strip=True).lower(): i for i, c in enumerate(header_cells)}
+
+    name_col  = _find_col(hmap, "name")
+    slot_col  = _find_col(hmap, "slot")
+    rar_col   = _find_col(hmap, "rarit")
+    desc_col  = _find_col(hmap, "description", "effect")
+    sets_col  = _find_col(hmap, "set")
+
+    if name_col is None:
+        return []
+
     items: list[Item] = []
-    tables = soup.select("table.wikitable") or soup.select("table")
-    for table in tables:
-        headers = _header_map(table)
-        name_col = _find_col(headers, "name")
-        slot_col = _find_col(headers, "slot", "type")
-        rarity_col = _find_col(headers, "rarit")
-        effect_col = _find_col(headers, "effect", "description")
-        sets_col = _find_col(headers, "set")
-        if name_col is None or sets_col is None:
-            continue  # not the items table
+    for row in rows[1:]:
+        cells = row.find_all(["td", "th"])
+        if not cells:
+            continue
 
-        for row in table.find_all("tr")[1:]:
-            cells = row.find_all(["td", "th"])
-            if len(cells) <= max(c for c in [name_col, sets_col] if c is not None):
-                continue
+        # Data rows have an extra icon cell at index 0 not reflected in headers.
+        off = 1 if len(cells) > n_headers else 0
 
-            def cell_text(col: Optional[int]) -> str:
-                if col is None or col >= len(cells):
-                    return ""
-                return cells[col].get_text(" ", strip=True)
+        def get(col: Optional[int]) -> str:
+            if col is None:
+                return ""
+            idx = col + off
+            return cells[idx].get_text(" ", strip=True) if idx < len(cells) else ""
 
-            name = cell_text(name_col)
-            if not name:
-                continue
+        def cell(col: Optional[int]):
+            if col is None:
+                return None
+            idx = col + off
+            return cells[idx] if idx < len(cells) else None
 
-            name_cell = cells[name_col]
-            link = name_cell.find("a")
-            page_url = _abs_url(link.get("href")) if link and link.get("href") else ""
+        name = get(name_col)
+        if not name:
+            continue
 
-            # Icon: first <img> in the row.
-            img = row.find("img")
+        link = (cell(name_col) or row).find("a")
+        page_url = _abs_url(link.get("href", "")) if link else ""
+
+        # Icon lives in the leading image cell (index 0 when off==1).
+        icon_url = ""
+        if off == 1:
+            img = cells[0].find("img")
             icon_url = _best_icon_url(img)
 
-            sets_raw = cell_text(sets_col)
-            sets = _split_sets(sets_raw, cells[sets_col])
+        sets_cell = cell(sets_col)
+        sets_raw = get(sets_col)
+        sets = _split_sets(sets_raw, sets_cell) if sets_cell is not None else []
 
-            items.append(
-                Item(
-                    name=name,
-                    slot=canonical_slot(cell_text(slot_col)),
-                    rarity=cell_text(rarity_col),
-                    effect=cell_text(effect_col),
-                    sets=sets,
-                    page_url=page_url,
-                    icon_url=icon_url,
-                )
-            )
-        if items:
-            break  # found and parsed the items table
+        items.append(Item(
+            name=name,
+            slot=canonical_slot(get(slot_col)),
+            rarity=get(rar_col),
+            effect=get(desc_col),
+            sets=sets,
+            page_url=page_url,
+            icon_url=icon_url,
+        ))
+
     return items
 
 
@@ -200,55 +230,62 @@ def _split_sets(raw: str, cell) -> list[str]:
 def parse_sets(soup: BeautifulSoup) -> dict[str, SetInfo]:
     """Parse the Item_sets page into {set_name: SetInfo}.
 
-    The page commonly renders each set as a table or a section. We handle both:
-      * tables with a 'Set'/'Name' column and a 'Bonus'/'Effect' column
-      * <h2>/<h3> section headings followed by descriptive text
+    The real page has ~97 separate tables, one per set, each with class
+    'mew-sets-table' and columns ['Slot', 'Item'].  The set name and bonus
+    description live in the heading / paragraphs that precede each table in
+    the document flow.
     """
     sets: dict[str, SetInfo] = {}
 
-    # Strategy 1: tables.
-    for table in soup.select("table.wikitable") or soup.select("table"):
-        headers = _header_map(table)
-        name_col = _find_col(headers, "set", "name")
-        bonus_col = _find_col(headers, "bonus", "effect", "description")
-        pieces_col = _find_col(headers, "piece", "items", "count")
-        if name_col is None or bonus_col is None:
+    for table in soup.find_all("table", class_="mew-sets-table"):
+        # ---- set name: nearest preceding heading ----
+        heading = table.find_previous(["h2", "h3", "h4"])
+        if not heading:
             continue
-        for row in table.find_all("tr")[1:]:
-            cells = row.find_all(["td", "th"])
-            if len(cells) <= max(name_col, bonus_col):
-                continue
-            name = cells[name_col].get_text(" ", strip=True)
-            bonus = cells[bonus_col].get_text(" ", strip=True)
-            if not name:
-                continue
-            pieces = 0
-            if pieces_col is not None and pieces_col < len(cells):
-                m = re.search(r"\d+", cells[pieces_col].get_text())
-                if m:
-                    pieces = int(m.group())
-            sets[name] = SetInfo(name=name, bonus=bonus, pieces=pieces)
-
-    if sets:
-        return sets
-
-    # Strategy 2: headings + following paragraph.
-    for heading in soup.select("h2, h3"):
-        name = heading.get_text(" ", strip=True)
-        name = re.sub(r"\[edit\]", "", name).strip()
-        if not name or name.lower() in {"contents", "navigation", "references"}:
+        # Prefer the mw-headline span (cleaner, no [edit] link text).
+        span = heading.find("span", class_="mw-headline")
+        if span:
+            set_name = span.get_text(" ", strip=True)
+        else:
+            set_name = re.sub(r"\[edit[^\]]*\]", "", heading.get_text(" ", strip=True)).strip()
+        if not set_name:
             continue
-        sib = heading.find_next_sibling()
-        bonus = ""
-        while sib is not None and sib.name not in {"h2", "h3"}:
-            if sib.name in {"p", "ul", "div"}:
+
+        # ---- bonus: text between the heading and this table ----
+        bonus_parts: list[str] = []
+        for sib in heading.find_next_siblings():
+            if sib is table:
+                break
+            if sib.name in ("h2", "h3", "h4"):
+                break  # hit the next set's heading before reaching our table
+            if hasattr(sib, "get_text"):
                 txt = sib.get_text(" ", strip=True)
-                if txt:
-                    bonus = txt
-                    break
-            sib = sib.find_next_sibling()
-        if bonus:
-            sets[name] = SetInfo(name=name, bonus=bonus)
+                if txt and sib.name not in ("table",):
+                    bonus_parts.append(txt)
+        bonus = " ".join(bonus_parts)
+
+        # ---- member items from table rows ----
+        member_items: list[str] = []
+        for row in table.find_all("tr")[1:]:   # skip the Slot/Item header row
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            # The Item cell contains "Name Name (Slot) description..." with a
+            # link; use the first <a> tag to get a clean item name.
+            link = cells[1].find("a")
+            item_name = link.get_text(strip=True) if link else cells[1].get_text(strip=True)
+            if item_name:
+                member_items.append(item_name)
+
+        # Only insert once per set name (first table encountered wins).
+        if set_name not in sets:
+            sets[set_name] = SetInfo(
+                name=set_name,
+                bonus=bonus,
+                member_items=member_items,
+                pieces=len(member_items),
+            )
+
     return sets
 
 
