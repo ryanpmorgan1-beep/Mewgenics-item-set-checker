@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mewgenics Set Checker</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐱</text></svg>">
+</head>
+<body>
+<header>
+  <h1>🐱 Mewgenics Set Checker</h1>
+  <div class="head-right">
+    <span id="healthPill" class="pill">checking…</span>
+    <button id="btnRescan" class="ghost" title="Re-scrape the wiki catalog">↻ Catalog</button>
+    <label class="ghost btn-like" title="Import a data bundle zip made with: python -m app.bootstrap --bundle data.zip">
+      ⇪ Import<input id="bundleInput" type="file" accept=".zip" hidden>
+    </label>
+  </div>
+</header>
+
+<div id="bootBanner" class="banner hidden"></div>
+
+<main>
+  <section id="left">
+    <div id="dropzone">
+      <input id="fileInput" type="file" accept="image/*" hidden>
+      <p><b>Drop a storage screenshot here</b> — or click, or paste (Ctrl+V)</p>
+      <p class="dim">Use the in-game Storage screen. Fullscreen screenshots work best.</p>
+    </div>
+
+    <div id="shotTabs" class="hidden"></div>
+
+    <div id="canvasWrap" class="hidden">
+      <canvas id="canvas"></canvas>
+      <div id="gridHint" class="hidden"></div>
+    </div>
+
+    <div id="canvasBar" class="hidden">
+      <button id="btnAddShot" class="ghost">＋ Add another screenshot</button>
+      <button id="btnAdjust" class="ghost">⌗ Adjust grid</button>
+      <button id="btnReviewUnsure" class="ghost">? Review unsure <span id="unsureCount"></span></button>
+      <label class="chk"><input type="checkbox" id="chkUnsure" checked> count unsure guesses</label>
+      <span id="analyzeInfo" class="dim"></span>
+    </div>
+  </section>
+
+  <section id="right">
+    <div class="tabs">
+      <button class="tab active" data-tab="sets">Set bonuses</button>
+      <button class="tab" data-tab="items">Detected items</button>
+    </div>
+    <div id="paneSets" class="pane">
+      <div id="setsSummary" class="dim">Upload a screenshot to see which set bonuses you can make.</div>
+      <div id="setsList"></div>
+      <div id="extraBar">
+        <button id="btnAddManual" class="ghost">＋ Add item not in storage (e.g. equipped)</button>
+        <div id="manualChips"></div>
+      </div>
+      <button id="btnCopy" class="ghost hidden">⧉ Copy results</button>
+    </div>
+    <div id="paneItems" class="pane hidden">
+      <div id="itemsList"></div>
+    </div>
+  </section>
+</main>
+
+<div id="spinner" class="overlay hidden">
+  <div class="spin-box"><div class="spinner"></div><div id="spinnerText">Analyzing…</div></div>
+</div>
+
+<div id="picker" class="overlay hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <img id="pickerCrop" alt="" class="crop">
+      <input id="pickerSearch" type="text" placeholder="Type to search items…" autocomplete="off">
+      <button id="pickerClose" class="ghost">✕</button>
+    </div>
+    <div class="modal-actions">
+      <button id="pickerEmpty" class="ghost">Mark cell as empty / ignore</button>
+    </div>
+    <div id="pickerList" class="modal-list"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

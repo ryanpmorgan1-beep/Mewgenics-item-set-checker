@@ -3,11 +3,9 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
 
-# Generated artifacts
-report.html
-/data/icons/
-/data/crops/
-
-# Keep the scraped catalog (data/catalog.json) commitable so the tool works
-# offline once you've scraped once.
+# Runtime data — the app scrapes the wiki catalog + icons itself at startup,
+# or you build it locally with:  python -m app.bootstrap
+data/
+data_bundle.zip

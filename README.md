@@ -1,109 +1,146 @@
-# Mewgenics Set-Bonus Finder
+# Mewgenics Set Checker
 
-Point it at a screenshot of your in-game **Storage / inventory** screen and it
-tells you every **set bonus** you can actually build with the items you own.
+Upload a screenshot of your in-game **Storage** screen and get back every
+**set bonus** you can actually wear, computed from the items you own.
 
-A set bonus needs **3 items that share a set name** — but with a catch: the 3
-items must occupy **distinct equipment slots** (Head / Face / Neck / Trinket /
-Weapon). You can only wear one Head item at a time, so three "Hippie" items that
-are all Head pieces do *not* make a wearable set. This tool enforces that rule.
+- Finds the storage grid in the screenshot automatically (any resolution).
+- Identifies each item by matching it against the icon catalog from the
+  [Mewgenics wiki](https://mewgenics.wiki.gg/wiki/Items).
+- Applies the real set rules from the
+  [Item sets page](https://mewgenics.wiki.gg/wiki/Item_sets): a bonus needs
+  **3+ pieces of the set worn at once**, across the 5 equipment slots
+  (Head / Face / Neck / Trinket / Weapon) — so three Head pieces of one set
+  don't count. The checker enforces the slot math for you.
+- Every guess is correctable: click any cell, pick the right item from a
+  searchable list, and the set results recompute instantly. Low-confidence
+  guesses are highlighted so you know what to double-check.
+- Multiple storage pages? Upload several screenshots — items merge into one
+  inventory. Items equipped on cats can be added manually.
 
-## How it works
+## Deploy on Railway
 
-```
-scrape   ─ pull the item + set catalog and icon images from the Mewgenics wiki
-           (cached to data/, so it only happens once)
-analyze  ─ crop the storage grid out of your screenshot, match each cell to a
-           wiki icon, then build an interactive HTML report
-```
+1. Push this repo to GitHub (already done if you're reading it there).
+2. In [Railway](https://railway.com): **New Project → Deploy from GitHub repo**
+   → pick this repo. Railway reads `railway.json` and builds the `Dockerfile`
+   automatically — no other settings needed.
+3. Generate a domain (service → **Settings → Networking → Generate Domain**).
+4. First boot: the app spends ~1–2 minutes scraping the wiki catalog and item
+   icons (progress shows in the page banner and `/api/health`). After that
+   it's instant.
 
-Because matching tiny, desaturated in-game icons against the wiki art is never
-100% reliable, the report is **assisted**: each detected cell has a dropdown
-pre-filled with the best guess (and the runner-up candidates). You confirm or
-correct anything that looks wrong, and the **Achievable set bonuses** panel
-recomputes live in the browser — no re-run needed.
+Optional:
 
-## Install
+- **Persist the catalog across deploys**: add a Volume mounted at `/app/data`.
+  Without it the app just re-scrapes on each deploy, which is fine too.
+- Set `AUTO_BOOTSTRAP=0` to disable the startup scrape (you'd then import a
+  bundle instead, see below).
+
+### If the wiki blocks the server (rare)
+
+The catalog banner would show a bootstrap failure. Build the data bundle on
+your own machine and import it — no redeploy needed:
 
 ```bash
 pip install -r requirements.txt
+python -m app.bootstrap --bundle data_bundle.zip
 ```
 
-`opencv-python-headless` is optional (only used for automatic grid detection).
-Everything else degrades gracefully if it's missing — just pass `--grid`.
+Then click **⇪ Import** in the app header and upload `data_bundle.zip`.
 
-## Usage
-
-### 1. Fetch the catalog (once)
+## Run locally
 
 ```bash
-python -m mewgenics_sets scrape
+pip install -r requirements.txt
+uvicorn app.main:app --port 8000
+# open http://localhost:8000
 ```
 
-This writes `data/catalog.json` and downloads icons to `data/icons/`. Commit
-`data/catalog.json` if you want the tool to work offline afterwards.
+Same first-boot behavior: it scrapes the wiki into `data/` once.
 
-> **Network note:** scraping must run somewhere the wiki
-> (`mewgenics.wiki.gg`) is reachable. Some CI / sandbox environments restrict
-> outbound traffic to package registries only — run `scrape` on your own
-> machine in that case.
+## Using it
 
-### 2. Analyze a screenshot
+1. **Screenshot the Storage screen** (the grid on the right side). Fullscreen
+   PNG screenshots work best; JPEG is fine.
+2. Drop it on the page. Analysis takes ~10–40 s depending on the machine.
+3. Review the grid overlay: **green** = confident, **amber** = check me,
+   **blue** = corrected by you, dashed = empty. Click any cell to fix it —
+   the picker shows the cell crop, the top match candidates, and a search box.
+4. Read the results: **Wearable now** (with an example 3-piece combo),
+   **One slot away** (with the exact items that would complete the set),
+   and progress on everything else. **⧉ Copy results** exports text.
+5. If the grid wasn't found or looks misaligned: **⌗ Adjust grid**, click the
+   top-left corner of the first tile and the bottom-right corner of the last
+   tile, set rows/columns, re-analyze.
 
-```bash
-python -m mewgenics_sets analyze \
-    --screenshot my_storage.png \
-    --grid 888,255,690,690 --rows 11 --cols 11 \
-    --open
-```
+## How the matching works (and why it now works)
 
-* `--grid x,y,w,h` is the pixel bounding box of the **storage grid only** (the
-  block of square slots on the right — not the whole screenshot). `--rows` /
-  `--cols` are how many slots fit in that box.
-* Omit `--grid` to try automatic detection (needs opencv); if it can't find a
-  convincing grid it'll tell you to pass an explicit box.
-* `--open` opens the generated `report.html` in your browser.
+The original version of this tool compared whole cell crops against whole
+wiki icons at one fixed framing and failed: in-game icons float inside their
+tile at an unknown scale/offset, tiles carry corner slot-glyphs, "NEW"
+ribbons, blessed-yellow glows and cursed-red tints, and screenshots add noise
+and compression.
 
-### 3. Confirm and read off your sets
+The rewrite treats it as a proper template-matching problem:
 
-In the report, scan the left column and fix any mis-identified items. Sets
-marked **COMPLETE** (green) are wearable right now; near-misses show how many
-more pieces — or which extra slot — you'd need.
-
-## Finding the grid box
-
-Open the screenshot in any image editor and read the pixel coordinates of the
-top-left corner of the first storage slot and the bottom-right of the last one.
-`x,y` is the top-left corner; `w,h` is the width/height of the whole grid block.
-The default `11x11` matches the standard storage layout; adjust if yours differs.
+- **Grid**: square-tile contours are clustered by size, snapped onto a
+  pitch lattice, and the largest consistent component becomes the grid —
+  resolution-independent, tolerant of missed tiles, with sparse boundary
+  rows (stray UI buttons) trimmed off. Verified to sub-2px accuracy on
+  fixtures at multiple resolutions.
+- **Matching**: every wiki icon is compared under its **alpha mask only**
+  (tile background and overlays never pollute the score) using
+  zero-normalized cross-correlation of high-passed grayscale + edge
+  magnitude, swept over 7 icon scales and a grid of offsets (coarse batched
+  pass over all ~270 icons, then precise refinement of the top 20). A
+  coverage term rejects matches that leave cell ink unexplained, and a
+  chroma term separates same-shape different-color items (red pill vs blue
+  pill) while ignoring tile tints.
+- The synthetic end-to-end test (`tests/test_grid_and_match.py`) renders a
+  fake storage screen — glows, tints, glyphs, ribbons, JPEG artifacts, two
+  resolutions — and requires ≥95% top-1 accuracy with zero
+  *confidently*-wrong matches. It currently measures ~99%, and real
+  screenshots are the easier case (identical art). Anything the matcher is
+  unsure about is flagged amber in the UI for a one-click fix.
 
 ## Project layout
 
 ```
-mewgenics_sets/
-  models.py    # Item / SetInfo / Catalog dataclasses, slot definitions
-  scrape.py    # wiki catalog + icon fetching (MediaWiki API + BeautifulSoup)
-  vision.py    # grid detection, cell cropping, icon matching (pHash + template)
-  solver.py    # slot-aware "is this set achievable?" logic
-  report.py    # interactive self-contained HTML report
-  cli.py       # `scrape` / `analyze` commands
-tests/         # solver + parsing tests (no network needed)
+app/
+  main.py       FastAPI app: /api/analyze, /api/health, /api/catalog, ...
+  grid.py       storage-grid detection (lattice fit)
+  matcher.py    masked multi-scale icon matching
+  solver.py     set-bonus rules (3 pieces, distinct slots)
+  bootstrap.py  wiki scraper: catalog + PNG icons (+ bundle export/import)
+  catalog.py    data model + persistence
+  static/       the web UI (vanilla JS)
+tests/          pytest suite incl. synthetic end-to-end vision test
+Dockerfile      Railway/anywhere deployment
+railway.json    Railway build + healthcheck config
 ```
+
+## API (if you want to script it)
+
+- `POST /api/analyze` — multipart `file` (+ optional `grid_x0,grid_y0,
+  grid_x1,grid_y1,rows,cols` for a manual grid; `debug=1` adds an overlay
+  image) → grid + per-cell candidates with confidences.
+- `GET /api/catalog` — items (name/slot/sets/icon) and sets (bonus/members).
+- `GET /api/health` — catalog & bootstrap status.
+- `POST /api/bootstrap` — re-scrape the wiki.
+- `POST /api/import-data` — upload a data bundle zip.
 
 ## Tests
 
 ```bash
-python tests/test_solver.py
-python tests/test_scrape_parsing.py
+pip install -r requirements-dev.txt
+pytest tests/
 ```
 
-## Notes & limitations
+## Notes & limits
 
-* Item **slots** are read straight from the Items table on the wiki, which is
-  what makes the slot-collision check possible.
-* Icon matching is a heuristic (perceptual hash + normalized template
-  correlation). It's good enough to seed the dropdowns, but always eyeball the
-  confirmations — that's exactly why the report is interactive.
-* If the wiki changes its table layout, `scrape.py` parses by **column header
-  name** (not position), so it should keep working; adjust the header keywords
-  in `_find_col(...)` if a column gets renamed.
+- Item identification is ~99% on fixtures but not guaranteed perfect on
+  every real screenshot — that's why every cell is click-to-fix and unsure
+  cells are highlighted. The set math is exact once items are confirmed.
+- The catalog mirrors the wiki; if the wiki is missing an item or set, so is
+  the checker. Press **↻ Catalog** anytime to re-scrape.
+- Set-requirement modifiers (Rune of Perthro, Item Proxy) aren't modeled;
+  the checker assumes the standard 3-piece rule.

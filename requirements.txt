@@ -1,16 +1,8 @@
-requests>=2.31
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+requests>=2.32
 beautifulsoup4>=4.12
-lxml>=4.9
-Pillow>=10.0
-numpy>=1.24
-imagehash>=4.3
-# SVG rasterization — the wiki serves icons as SVG files.
-# reportlab 5.0+ requires rlPyCairo as its rendering backend (replaces the
-# old bundled _renderPM C extension). rlPyCairo brings pycairo which has
-# pre-built Windows wheels, so no system-level Cairo installation is needed.
-svglib>=1.5
-reportlab>=4.0
-rlPyCairo>=0.2
-# Optional, only needed for automatic grid detection in vision.py.
-# The tool degrades gracefully (manual --grid) if this is missing.
-opencv-python-headless>=4.8
+lxml>=5.2
+numpy>=1.26
+opencv-python-headless>=4.10

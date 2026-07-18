@@ -1,103 +1,71 @@
-"""Tests for the slot-aware set solver (the logic that decides achievability)."""
+"""Set-solver rules: a bonus is wearable with >=3 pieces across >=3 slots."""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from mewgenics_sets.models import Catalog, Item, SetInfo
-from mewgenics_sets.solver import solve
+from app.catalog import Catalog, Item, SetInfo
+from app.solver import solve
 
 
-def _item(name, slot, *sets):
-    return Item(name=name, slot=slot, sets=list(sets))
-
-
-def _catalog():
-    cat = Catalog()
-    cat.sets = {
-        "Hippie": SetInfo(name="Hippie", bonus="Peace bonus"),
-        "Twine": SetInfo(name="Twine", bonus="Twine bonus"),
-        "Bone": SetInfo(name="Bone", bonus="+4 Shield"),
-    }
-    return cat
-
-
-def test_three_distinct_slots_is_achievable():
-    cat = _catalog()
-    owned = [
-        _item("Peace Symbol", "Neck", "Hippie", "Twine"),
-        _item("Flower Crown", "Head", "Hippie"),
-        _item("Tie Dye Shirt", "Trinket", "Hippie"),
+def _catalog() -> Catalog:
+    items = [
+        Item(name="Flower Crown", slot="Head", sets=["Hippie"]),
+        Item(name="Peace Symbol", slot="Neck", sets=["Hippie", "Twine"]),
+        Item(name="Tie Dye Shirt", slot="Trinket", sets=["Hippie"]),
+        Item(name="Round Glasses", slot="Face", sets=["Hippie"]),
+        Item(name="Twine Hat", slot="Head", sets=["Twine"]),
+        Item(name="Hemp Rope", slot="Trinket", sets=["Twine"]),
+        Item(name="Bandana A", slot="Head", sets=["Cowboy"]),
+        Item(name="Bandana B", slot="Head", sets=["Cowboy"]),
+        Item(name="Bandana C", slot="Head", sets=["Cowboy"]),
+        Item(name="Lasso", slot="Weapon", sets=["Cowboy"]),
     ]
-    results = {r.name: r for r in solve(cat, owned)}
-    assert results["Hippie"].achievable is True
-    assert len(results["Hippie"].example_combo) == 3
-    slots = {it.normalized_slot() for it in results["Hippie"].example_combo}
-    assert len(slots) == 3
+    sets: dict[str, SetInfo] = {}
+    for it in items:
+        for s in it.sets:
+            sets.setdefault(s, SetInfo(name=s, bonus=f"{s} bonus")).members.append(it.name)
+    return Catalog(items=items, sets=sets)
+
+
+def test_wearable_with_three_distinct_slots():
+    cat = _catalog()
+    res = solve(cat, ["Flower Crown", "Peace Symbol", "Tie Dye Shirt"])
+    hippie = next(r for r in res if r.name == "Hippie")
+    assert hippie.wearable
+    assert len(hippie.combo) == 3
+    assert {i.normalized_slot() for i in hippie.combo} == {"Head", "Neck", "Trinket"}
+
+
+def test_not_wearable_with_two_pieces():
+    cat = _catalog()
+    res = solve(cat, ["Flower Crown", "Peace Symbol"])
+    hippie = next(r for r in res if r.name == "Hippie")
+    assert not hippie.wearable
+    assert hippie.status == "close"
+    assert set(hippie.missing) == {"Tie Dye Shirt", "Round Glasses"}
 
 
 def test_slot_collision_blocks_set():
-    # Three Hippie items but two share the Head slot -> cannot wear all three.
     cat = _catalog()
-    owned = [
-        _item("Flower Crown", "Head", "Hippie"),
-        _item("Bandana", "Head", "Hippie"),
-        _item("Peace Symbol", "Neck", "Hippie"),
-    ]
-    r = {x.name: x for x in solve(cat, owned)}["Hippie"]
-    assert r.owned_count == 3
-    assert r.achievable is False
-    assert sorted(r.distinct_slots) == ["Head", "Neck"]
-    assert "distinct slots" in r.missing_slot_note
+    res = solve(cat, ["Bandana A", "Bandana B", "Bandana C"])
+    cowboy = next(r for r in res if r.name == "Cowboy")
+    assert not cowboy.wearable
+    assert cowboy.status == "slot_blocked"
 
 
-def test_fewer_than_three_owned_not_achievable():
+def test_duplicates_do_not_double_count():
     cat = _catalog()
-    owned = [
-        _item("Peace Symbol", "Neck", "Hippie", "Twine"),
-        _item("Flower Crown", "Head", "Hippie"),
-    ]
-    r = {x.name: x for x in solve(cat, owned)}["Hippie"]
-    assert r.achievable is False
-    assert "2 of 3" in r.missing_slot_note
+    res = solve(cat, ["Flower Crown", "Flower Crown", "Peace Symbol"])
+    hippie = next(r for r in res if r.name == "Hippie")
+    assert not hippie.wearable
+    assert len(hippie.owned) == 2
 
 
-def test_item_counts_toward_multiple_sets():
+def test_shared_item_counts_for_both_sets():
     cat = _catalog()
-    owned = [
-        _item("Peace Symbol", "Neck", "Hippie", "Twine"),
-        _item("Hemp Rope", "Trinket", "Twine"),
-        _item("Macrame Bag", "Head", "Twine"),
-    ]
-    r = {x.name: x for x in solve(cat, owned)}
-    assert r["Twine"].achievable is True
-    # Peace Symbol also seeds Hippie, but only 1 Hippie item -> not achievable.
-    assert r["Hippie"].achievable is False
+    res = solve(cat, ["Peace Symbol", "Twine Hat", "Hemp Rope"])
+    twine = next(r for r in res if r.name == "Twine")
+    assert twine.wearable
+    assert "Hippie" in {r.name for r in res}
 
 
-def test_duplicate_item_names_collapse():
+def test_unknown_items_ignored():
     cat = _catalog()
-    owned = [
-        _item("Peace Symbol", "Neck", "Hippie"),
-        _item("Peace Symbol", "Neck", "Hippie"),  # same item detected twice
-        _item("Flower Crown", "Head", "Hippie"),
-    ]
-    r = {x.name: x for x in solve(cat, owned)}["Hippie"]
-    assert r.owned_count == 2          # collapsed
-    assert r.achievable is False
-
-
-if __name__ == "__main__":
-    import traceback
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"PASS {fn.__name__}")
-        except Exception:
-            failed += 1
-            print(f"FAIL {fn.__name__}")
-            traceback.print_exc()
-    raise SystemExit(1 if failed else 0)
+    assert solve(cat, ["Nonexistent Thing"]) == []
