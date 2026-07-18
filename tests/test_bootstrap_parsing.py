@@ -9,8 +9,9 @@ import zipfile
 import pytest
 from bs4 import BeautifulSoup
 
-from app.bootstrap import (import_bundle, parse_items, parse_sets,
-                           source_file_from_image_url)
+from app.bootstrap import (import_bundle, original_url_from_thumb, parse_items,
+                           parse_sets, source_file_from_image_url,
+                           upsize_thumb_url)
 
 ITEMS_HTML = """
 <table class="shuffle__items wikitable sortable mew-sticky-header">
@@ -100,6 +101,21 @@ def test_source_file_from_image_url():
     ) == "Peace_Symbol.svg"
     assert source_file_from_image_url(
         "https://mewgenics.wiki.gg/images/a/ab/Crown.png?v=3") == "Crown.png"
+
+
+def test_upsize_thumb_url():
+    assert upsize_thumb_url(
+        "https://mewgenics.wiki.gg/images/thumb/a/ab/P.svg/40px-P.svg.png?v=1", 160
+    ) == "https://mewgenics.wiki.gg/images/thumb/a/ab/P.svg/160px-P.svg.png"
+    # non-thumb URLs can't be resized
+    assert upsize_thumb_url("https://mewgenics.wiki.gg/images/a/ab/C.png", 160) is None
+
+
+def test_original_url_from_thumb():
+    assert original_url_from_thumb(
+        "https://mewgenics.wiki.gg/images/thumb/a/ab/C.png/40px-C.png"
+    ) == "https://mewgenics.wiki.gg/images/a/ab/C.png"
+    assert original_url_from_thumb("https://mewgenics.wiki.gg/images/a/ab/C.png") is None
 
 
 # --------------------------------------------------------------------------- #

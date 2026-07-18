@@ -14,9 +14,16 @@ Data sources (https://mewgenics.wiki.gg, MediaWiki):
   * ``Items`` page      -> name, slot, rarity, cursed, description, uses,
                            set tags, icon image
   * ``Item_sets`` page  -> per-set bonus text + member items
-  * ``imageinfo`` API   -> guaranteed-raster PNG thumbnails for every icon
-                           (the wiki stores many icons as SVG; the thumbnail
-                           API rasterizes them server-side)
+  * icon images         -> fetched from the thumbnail URLs already present in
+                           the Items table, rewritten to a larger size.
+                           MediaWiki thumb URLs are predictable
+                           (``.../thumb/a/ab/X.svg/40px-X.svg.png`` ->
+                           ``160px-X.svg.png``), and the server rasterizes
+                           SVG sources to PNG on demand. We deliberately do
+                           NOT use the ``imageinfo`` API: its 50-titles-long
+                           query strings trip Cloudflare's WAF (observed 403s
+                           even from residential IPs while plain page and
+                           image GETs pass).
 
 Parsers select columns by header *name*, not position, so modest wiki layout
 changes keep working. Structure verified against the live wiki (table class
@@ -324,7 +331,7 @@ def parse_sets(soup: BeautifulSoup) -> dict[str, SetInfo]:
 
 
 # --------------------------------------------------------------------------- #
-# Icons via the imageinfo thumbnail API (server-side rasterized PNGs)
+# Icons via direct (rewritten) thumbnail URLs
 # --------------------------------------------------------------------------- #
 def source_file_from_image_url(url: str) -> str:
     """Recover the wiki File name behind an <img> URL.
@@ -339,30 +346,26 @@ def source_file_from_image_url(url: str) -> str:
     return unquote(segments[-1]) if segments else ""
 
 
-def _thumbnail_urls(filenames: list[str], session: requests.Session,
-                    progress: Optional[ProgressCb] = None) -> dict[str, str]:
-    """{File name: rasterized PNG thumb URL} in batches of 50."""
-    result: dict[str, str] = {}
-    for i in range(0, len(filenames), 50):
-        batch = filenames[i:i + 50]
-        try:
-            r = _get(session, API, params={
-                "action": "query", "prop": "imageinfo", "iiprop": "url",
-                "iiurlwidth": str(ICON_PX),
-                "titles": "|".join(f"File:{f}" for f in batch),
-                "format": "json",
-            }, progress=progress)
-            pages = r.json().get("query", {}).get("pages", {})
-            for pg in pages.values():
-                fname = pg.get("title", "").replace("File:", "", 1)
-                info = (pg.get("imageinfo") or [{}])[0]
-                url = info.get("thumburl") or info.get("url") or ""
-                if url:
-                    result[fname] = _abs_url(url)
-        except RuntimeError as exc:
-            if progress:
-                progress(f"thumbnail batch failed: {exc}")
-    return result
+def upsize_thumb_url(url: str, px: int) -> str | None:
+    """Rewrite a MediaWiki thumb URL to a different pixel size.
+
+    ``.../thumb/a/ab/X.svg/40px-X.svg.png`` -> ``.../thumb/a/ab/X.svg/160px-...``
+    Returns None for non-thumb URLs.
+    """
+    path = url.split("?")[0]
+    m = re.match(r"^(.*/thumb/.*/)\d+px-([^/]+)$", path)
+    if not m:
+        return None
+    return f"{m.group(1)}{px}px-{m.group(2)}"
+
+
+def original_url_from_thumb(url: str) -> str | None:
+    """``.../images/thumb/a/ab/X.png/40px-X.png`` -> ``.../images/a/ab/X.png``."""
+    path = url.split("?")[0]
+    m = re.match(r"^(.*)/thumb/(.+)/[^/]+$", path)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
 
 
 def _slug(name: str) -> str:
@@ -375,49 +378,65 @@ def _looks_like_raster(data: bytes) -> bool:
             or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
 
 
-def download_icons(catalog: Catalog, data_dir: str, session: requests.Session,
+def download_icons(catalog: Catalog, data_dir: str, session,
                    progress: Optional[ProgressCb] = None) -> dict:
+    """Fetch every item's icon as a raster PNG using plain image GETs.
+
+    Candidate URLs per item, first raster wins:
+      1. the item's thumb URL rewritten to ICON_PX (server rasterizes SVGs)
+      2. the thumb URL exactly as scraped from the Items table
+      3. the original full-size file (only when the source isn't an SVG)
+    """
     icon_dir = os.path.join(data_dir, ICON_DIR)
     os.makedirs(icon_dir, exist_ok=True)
 
-    sources: dict[str, str] = {}
-    for it in catalog.items:
-        if it.icon_url:
-            src = source_file_from_image_url(it.icon_url)
-            if src:
-                sources[src] = ""
-    if progress:
-        progress(f"resolving {len(sources)} icon thumbnails ...")
-    thumb_map = _thumbnail_urls(list(sources), session, progress)
+    stats = {"ok": 0, "failed": 0, "no_url": 0}
+    bytes_cache: dict[str, bytes | None] = {}   # many items share one icon URL
 
-    stats = {"ok": 0, "failed": 0, "no_url": 0, "non_raster": 0}
+    def fetch_raster(url: str) -> bytes | None:
+        if url in bytes_cache:
+            return bytes_cache[url]
+        data = None
+        try:
+            r = _get(session, url, tries=2)
+            if _looks_like_raster(r.content):
+                data = r.content
+        except RuntimeError:
+            pass
+        bytes_cache[url] = data
+        time.sleep(0.03)
+        return data
+
+    total = len(catalog.items)
     for n, it in enumerate(catalog.items):
         if not it.icon_url:
             stats["no_url"] += 1
             continue
         src = source_file_from_image_url(it.icon_url)
-        url = thumb_map.get(src) or it.icon_url
-        fname = _slug(it.name) + ".png"
-        path = os.path.join(icon_dir, fname)
-        try:
-            r = _get(session, url, tries=2)
-            data = r.content
-            if not _looks_like_raster(data):
-                # got SVG/HTML bytes — fall back to the original element URL
-                r = _get(session, it.icon_url, tries=2)
-                data = r.content
-            if not _looks_like_raster(data):
-                stats["non_raster"] += 1
-                continue
-            with open(path, "wb") as fh:
-                fh.write(data)
-            it.icon_file = fname
-            stats["ok"] += 1
-            if progress and (n + 1) % 25 == 0:
-                progress(f"icons {n + 1}/{len(catalog.items)} ...")
-            time.sleep(0.04)
-        except RuntimeError:
+        candidates = []
+        up = upsize_thumb_url(it.icon_url, ICON_PX)
+        if up:
+            candidates.append(up)
+        candidates.append(it.icon_url)
+        orig = original_url_from_thumb(it.icon_url)
+        if orig and not src.lower().endswith(".svg"):
+            candidates.append(orig)
+
+        data = None
+        for u in candidates:
+            data = fetch_raster(u)
+            if data:
+                break
+        if data is None:
             stats["failed"] += 1
+            continue
+        fname = _slug(it.name) + ".png"
+        with open(os.path.join(icon_dir, fname), "wb") as fh:
+            fh.write(data)
+        it.icon_file = fname
+        stats["ok"] += 1
+        if progress and (n + 1) % 50 == 0:
+            progress(f"icons {n + 1}/{total} ...")
     return stats
 
 
