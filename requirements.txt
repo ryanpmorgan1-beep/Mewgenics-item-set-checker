@@ -3,6 +3,7 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 requests>=2.32
 curl-cffi>=0.7
+resvg-py>=0.3
 beautifulsoup4>=4.12
 lxml>=5.2
 numpy>=1.26

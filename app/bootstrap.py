@@ -14,16 +14,14 @@ Data sources (https://mewgenics.wiki.gg, MediaWiki):
   * ``Items`` page      -> name, slot, rarity, cursed, description, uses,
                            set tags, icon image
   * ``Item_sets`` page  -> per-set bonus text + member items
-  * icon images         -> fetched from the thumbnail URLs already present in
-                           the Items table, rewritten to a larger size.
-                           MediaWiki thumb URLs are predictable
-                           (``.../thumb/a/ab/X.svg/40px-X.svg.png`` ->
-                           ``160px-X.svg.png``), and the server rasterizes
-                           SVG sources to PNG on demand. We deliberately do
-                           NOT use the ``imageinfo`` API: its 50-titles-long
-                           query strings trip Cloudflare's WAF (observed 403s
-                           even from residential IPs while plain page and
-                           image GETs pass).
+  * icon images         -> the Items table links icons as **raw SVG files**
+                           and this wiki serves no PNG renditions of them at
+                           all: the on-demand thumb path 404s, and the
+                           ``imageinfo`` API's 50-titles-long query strings
+                           trip Cloudflare's WAF (403 even from residential
+                           IPs, while plain page and image GETs pass). So we
+                           download the SVGs and rasterize them locally with
+                           resvg (prebuilt wheels, no system deps).
 
 Parsers select columns by header *name*, not position, so modest wiki layout
 changes keep working. Structure verified against the live wiki (table class
@@ -61,6 +59,12 @@ try:
 except ImportError:                                     # pragma: no cover
     curl_requests = None
 
+# The wiki's item icons are raw SVGs; resvg rasterizes them to PNG locally.
+try:
+    import resvg_py
+except ImportError:                                     # pragma: no cover
+    resvg_py = None
+
 WIKI = "https://mewgenics.wiki.gg"
 API = f"{WIKI}/api.php"
 ICON_PX = 160          # requested thumbnail width — plenty for 96px matching
@@ -77,6 +81,10 @@ _UAS = [
 _IMPERSONATE = ["chrome", "safari", "edge101"]
 
 ProgressCb = Callable[[str], None]
+
+
+class _NotFound(RuntimeError):
+    """Deterministic 404 — retrying is pointless."""
 
 
 class _Fetcher:
@@ -105,12 +113,14 @@ class _Fetcher:
         })
         self._s = s
 
-    def get(self, url: str, *, params=None, tries: int = 3,
+    def get(self, url: str, *, params=None, tries: int = 3, timeout: int = 40,
             progress: Optional[ProgressCb] = None):
         last: Exception | None = None
         for attempt in range(tries):
             try:
-                resp = self._s.get(url, params=params, timeout=40)
+                resp = self._s.get(url, params=params, timeout=timeout)
+                if resp.status_code == 404:
+                    raise _NotFound(f"HTTP 404: {url}")
                 if resp.status_code in (403, 429, 503) and attempt < tries - 1:
                     if progress:
                         progress(f"HTTP {resp.status_code} from wiki — retrying "
@@ -120,11 +130,14 @@ class _Fetcher:
                     continue
                 resp.raise_for_status()
                 return resp
+            except _NotFound:
+                raise
             except Exception as exc:   # network/TLS layer errors from either backend
                 last = exc
-                time.sleep(2 * (attempt + 1))
-                self._make_session(attempt + 1)
-        raise RuntimeError(f"wiki request failed after {tries} tries: {last}")
+                if attempt < tries - 1:
+                    time.sleep(1 + attempt)
+                    self._make_session(attempt + 1)
+        raise RuntimeError(f"{type(last).__name__}: {last}")
 
 
 def _session(ua_index: int = 0) -> _Fetcher:
@@ -400,72 +413,183 @@ def _looks_like_raster(data: bytes) -> bool:
             or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
 
 
-def download_icons(catalog: Catalog, data_dir: str, session,
+def _looks_like_svg(data: bytes) -> bool:
+    head = data.lstrip()[:512].lower()
+    return head.startswith(b"<") and (b"<svg" in head or head.startswith(b"<?xml"))
+
+
+def _rasterize_svg(data: bytes, px: int) -> bytes | None:
+    """SVG bytes -> PNG bytes (with alpha) at the given width, or None."""
+    if resvg_py is not None:
+        try:
+            out = resvg_py.svg_to_bytes(svg_string=data.decode("utf-8", "replace"),
+                                        width=px)
+            png = bytes(out)
+            if _looks_like_raster(png):
+                return png
+        except Exception:
+            pass
+    try:                                               # optional fallback
+        import cairosvg
+        png = cairosvg.svg2png(bytestring=data, output_width=px)
+        if png and _looks_like_raster(png):
+            return png
+    except Exception:
+        pass
+    return None
+
+
+ICON_TIMEOUT = 12       # seconds per image request (2 tries)
+ICON_WORKERS = 8        # parallel downloads
+FAIL_FAST_AFTER = 25    # abort if this many icons fail before any succeeds
+
+
+def _icon_candidates(icon_url: str) -> list[str]:
+    """Candidate URLs for one icon, most-preferred first.
+
+    The scraped URL itself comes first for direct files (it's a raw SVG we
+    rasterize locally); size-rewritten thumb URLs help when the scraped URL
+    is already a thumb; the constructed thumb is a last resort (404s when
+    the wiki has no PNG renditions, which costs one fast request).
+    """
+    src = source_file_from_image_url(icon_url)
+    candidates = []
+    up = upsize_thumb_url(icon_url, ICON_PX)
+    if up:
+        candidates.append(up)
+    candidates.append(icon_url)
+    orig = original_url_from_thumb(icon_url)
+    if orig and not src.lower().endswith(".svg"):
+        candidates.append(orig)
+    built = thumb_url_from_original(icon_url, ICON_PX)
+    if built:
+        candidates.append(built)
+    return list(dict.fromkeys(candidates))
+
+
+def download_icons(catalog: Catalog, data_dir: str, session=None,
                    progress: Optional[ProgressCb] = None) -> dict:
     """Fetch every item's icon as a raster PNG using plain image GETs.
 
-    Candidate URLs per item, first raster wins:
-      1. thumb URL rewritten to ICON_PX (when the scraped URL is a thumb)
-      2. constructed on-demand thumb (when the scraped URL is a direct file,
-         which is the norm here — the Items table links raw SVGs)
-      3. the URL exactly as scraped
-      4. the original full-size file (only when the source isn't an SVG)
+    Runs ICON_WORKERS downloads in parallel (each worker owns its own
+    session), logs the first few failures verbosely, and aborts early if
+    nothing succeeds — so a blocked network fails loudly in seconds instead
+    of grinding silently for an hour.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     icon_dir = os.path.join(data_dir, ICON_DIR)
     os.makedirs(icon_dir, exist_ok=True)
 
     stats = {"ok": 0, "failed": 0, "no_url": 0}
-    bytes_cache: dict[str, bytes | None] = {}   # many items share one icon URL
-
-    def fetch_raster(url: str) -> bytes | None:
-        if url in bytes_cache:
-            return bytes_cache[url]
-        data = None
-        try:
-            r = _get(session, url, tries=2)
-            if _looks_like_raster(r.content):
-                data = r.content
-        except RuntimeError:
-            pass
-        bytes_cache[url] = data
-        time.sleep(0.03)
-        return data
+    lock = threading.Lock()
+    fail_notes: list[str] = []
+    done_count = [0]
+    abort = threading.Event()
+    fetchers = threading.local()
 
     total = len(catalog.items)
-    for n, it in enumerate(catalog.items):
-        if not it.icon_url:
-            stats["no_url"] += 1
-            continue
-        src = source_file_from_image_url(it.icon_url)
-        candidates = []
-        up = upsize_thumb_url(it.icon_url, ICON_PX)
-        if up:
-            candidates.append(up)
-        built = thumb_url_from_original(it.icon_url, ICON_PX)
-        if built:
-            candidates.append(built)
-        candidates.append(it.icon_url)
-        orig = original_url_from_thumb(it.icon_url)
-        if orig and not src.lower().endswith(".svg"):
-            candidates.append(orig)
-        candidates = list(dict.fromkeys(candidates))
 
-        data = None
-        for u in candidates:
-            data = fetch_raster(u)
-            if data:
+    def work(it: Item) -> None:
+        if abort.is_set():
+            return
+        if not it.icon_url:
+            with lock:
+                stats["no_url"] += 1
+            return
+        f = getattr(fetchers, "f", None)
+        if f is None:
+            f = _Fetcher()
+            fetchers.f = f
+        data, last_err = None, ""
+        for u in _icon_candidates(it.icon_url):
+            try:
+                r = f.get(u, tries=2, timeout=ICON_TIMEOUT)
+            except RuntimeError as exc:
+                last_err = f"{exc}"
+                continue
+            if _looks_like_raster(r.content):
+                data = r.content
                 break
-        if data is None:
-            stats["failed"] += 1
-            continue
-        fname = _slug(it.name) + ".png"
-        with open(os.path.join(icon_dir, fname), "wb") as fh:
-            fh.write(data)
-        it.icon_file = fname
-        stats["ok"] += 1
-        if progress and (n + 1) % 50 == 0:
-            progress(f"icons {n + 1}/{total} ...")
+            if _looks_like_svg(r.content):
+                png = _rasterize_svg(r.content, ICON_PX)
+                if png:
+                    data = png
+                    break
+                last_err = ("SVG icon but no rasterizer worked — "
+                            "pip install resvg-py")
+            else:
+                last_err = f"unrecognized content ({len(r.content)}B) from {u}"
+        with lock:
+            if data is None:
+                stats["failed"] += 1
+                if len(fail_notes) < 6:
+                    fail_notes.append(last_err)
+                    if progress:
+                        progress(f"icon failed: {it.name}: {last_err}")
+                if stats["ok"] == 0 and stats["failed"] >= FAIL_FAST_AFTER:
+                    abort.set()
+            else:
+                fname = _slug(it.name) + ".png"
+                with open(os.path.join(icon_dir, fname), "wb") as fh:
+                    fh.write(data)
+                it.icon_file = fname
+                stats["ok"] += 1
+            done_count[0] += 1
+            if progress and done_count[0] % 50 == 0:
+                progress(f"icons {done_count[0]}/{total} "
+                         f"(ok {stats['ok']}, failed {stats['failed']}) ...")
+
+    with ThreadPoolExecutor(max_workers=ICON_WORKERS) as pool:
+        list(pool.map(work, catalog.items))
+
+    if abort.is_set():
+        raise RuntimeError(
+            f"aborted: first {stats['failed']} icon downloads all failed "
+            f"(e.g. {fail_notes[0] if fail_notes else 'unknown'}). The wiki "
+            "is refusing image requests from this network right now — wait "
+            "10-20 minutes and re-run, or run the bootstrap elsewhere.")
     return stats
+
+
+def probe(data_dir: str) -> None:
+    """Verbosely test icon fetching for the first few catalog items."""
+    try:
+        catalog = load_catalog(data_dir)
+    except FileNotFoundError:
+        print("no catalog.json yet — fetching the Items page first ...")
+        session = _session()
+        items = parse_items(_parse_page_html("Items", session, progress=print))
+        catalog = Catalog(items=items)
+        print(f"parsed {len(items)} items")
+
+    with_icons = [it for it in catalog.items if it.icon_url][:3]
+    if not with_icons:
+        print("no items with icon URLs — the Items page parse found no images")
+        return
+    f = _Fetcher()
+    print(f"fetch backend: {f._mode}, svg rasterizer: "
+          f"{'resvg' if resvg_py is not None else 'MISSING (pip install resvg-py)'}")
+    for it in with_icons:
+        print(f"\n=== {it.name}")
+        print(f"    scraped icon_url: {it.icon_url}")
+        for u in _icon_candidates(it.icon_url):
+            t0 = time.time()
+            try:
+                r = f.get(u, tries=1, timeout=10)
+            except RuntimeError as exc:
+                print(f"    [ERR] {time.time()-t0:5.1f}s  {u}\n          {exc}")
+                continue
+            if _looks_like_raster(r.content):
+                kind = "PNG"
+            elif _looks_like_svg(r.content):
+                png = _rasterize_svg(r.content, ICON_PX)
+                kind = f"SVG->PNG({len(png)}B)" if png else "SVG (raster FAILED)"
+            else:
+                kind = "other"
+            print(f"    [{r.status_code}] {kind:18s} {len(r.content):7d}B "
+                  f"{time.time()-t0:5.1f}s  {u}")
 
 
 # --------------------------------------------------------------------------- #
@@ -586,7 +710,13 @@ def main() -> None:
     ap.add_argument("--data-dir", default=os.environ.get("DATA_DIR", "data"))
     ap.add_argument("--bundle", metavar="ZIP",
                     help="also export a data bundle zip for offline import")
+    ap.add_argument("--probe", action="store_true",
+                    help="verbosely test icon fetching for 3 items, then exit")
     args = ap.parse_args()
+
+    if args.probe:
+        probe(args.data_dir)
+        return
 
     catalog = run_bootstrap(args.data_dir, progress=print)
     print(f"catalog: {len(catalog.items)} items, {len(catalog.sets)} sets")

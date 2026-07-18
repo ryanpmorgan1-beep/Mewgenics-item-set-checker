@@ -9,9 +9,14 @@ import zipfile
 import pytest
 from bs4 import BeautifulSoup
 
+from app import bootstrap as bs
 from app.bootstrap import (import_bundle, original_url_from_thumb, parse_items,
                            parse_sets, source_file_from_image_url,
                            thumb_url_from_original, upsize_thumb_url)
+from app.catalog import Catalog, Item
+
+TINY_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+            b'<rect x="4" y="4" width="24" height="24" fill="#222"/></svg>')
 
 ITEMS_HTML = """
 <table class="shuffle__items wikitable sortable mew-sticky-header">
@@ -131,6 +136,48 @@ def test_thumb_url_from_original():
     # already a thumb -> handled by upsize, not this builder
     assert thumb_url_from_original(
         "https://mewgenics.wiki.gg/images/thumb/a/ab/X.svg/40px-X.svg.png", 160) is None
+
+
+def test_rasterize_svg_produces_png_with_alpha():
+    assert bs._looks_like_svg(TINY_SVG)
+    assert bs._looks_like_svg(b'\n<?xml version="1.0"?><svg></svg>')
+    assert not bs._looks_like_svg(b"\x89PNG\r\n\x1a\nxxxx")
+    png = bs._rasterize_svg(TINY_SVG, 64)
+    assert png is not None and bs._looks_like_raster(png)
+
+
+def test_download_icons_rasterizes_svg(tmp_path, monkeypatch):
+    """The wiki serves raw SVGs; the loop must rasterize and save PNGs."""
+    class FakeResp:
+        def __init__(self, content):
+            self.content = content
+
+    def fake_get(self, url, **kw):
+        if "/thumb/" in url:
+            raise bs._NotFound(f"HTTP 404: {url}")   # wiki has no PNG thumbs
+        return FakeResp(TINY_SVG)
+
+    monkeypatch.setattr(bs._Fetcher, "get", fake_get)
+    cat = Catalog(items=[
+        Item(name=f"Item {i}", icon_url=f"https://w/images/a/ab/I{i}.svg")
+        for i in range(6)])
+    stats = bs.download_icons(cat, str(tmp_path))
+    assert stats == {"ok": 6, "failed": 0, "no_url": 0}
+    for it in cat.items:
+        p = tmp_path / "icons" / it.icon_file
+        assert p.exists() and p.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_download_icons_fail_fast(tmp_path, monkeypatch):
+    def fake_get(self, url, **kw):
+        raise RuntimeError("Timeout: simulated")
+
+    monkeypatch.setattr(bs._Fetcher, "get", fake_get)
+    cat = Catalog(items=[
+        Item(name=f"Item {i}", icon_url=f"https://w/images/a/ab/I{i}.svg")
+        for i in range(bs.FAIL_FAST_AFTER + 20)])
+    with pytest.raises(RuntimeError, match="aborted"):
+        bs.download_icons(cat, str(tmp_path))
 
 
 # --------------------------------------------------------------------------- #
