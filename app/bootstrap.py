@@ -45,6 +45,15 @@ from .catalog import (
     load_catalog, save_catalog,
 )
 
+# The wiki sits behind Cloudflare, which 403s generic Python HTTP clients from
+# datacenter IPs (e.g. Railway) based on TLS fingerprinting. curl_cffi
+# impersonates a real browser's TLS/HTTP2 fingerprint and usually passes.
+# Plain requests remains as fallback (fine from residential IPs).
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:                                     # pragma: no cover
+    curl_requests = None
+
 WIKI = "https://mewgenics.wiki.gg"
 API = f"{WIKI}/api.php"
 ICON_PX = 160          # requested thumbnail width — plenty for 96px matching
@@ -57,39 +66,67 @@ _UAS = [
     "MewgenicsSetChecker/1.0 (personal tool)",
 ]
 
+# Browser profiles curl_cffi can impersonate, tried in order on retries.
+_IMPERSONATE = ["chrome", "safari", "edge101"]
+
 ProgressCb = Callable[[str], None]
 
 
-def _session(ua_index: int = 0) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": _UAS[ua_index % len(_UAS)],
-        "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{WIKI}/wiki/Items",
-    })
-    return s
+class _Fetcher:
+    """One retrying GET interface over curl_cffi (preferred) or requests."""
 
+    def __init__(self) -> None:
+        self._mode = "curl" if curl_requests is not None else "requests"
+        self._make_session(0)
 
-def _get(session: requests.Session, url: str, *, params=None, tries: int = 3,
-         progress: Optional[ProgressCb] = None) -> requests.Response:
-    last: Exception | None = None
-    for attempt in range(tries):
-        try:
-            resp = session.get(url, params=params, timeout=40)
-            if resp.status_code in (403, 429, 503) and attempt < tries - 1:
-                if progress:
-                    progress(f"HTTP {resp.status_code} from wiki, retrying "
-                             f"with different client headers ...")
+    def _make_session(self, attempt: int) -> None:
+        if self._mode == "curl":
+            profile = _IMPERSONATE[attempt % len(_IMPERSONATE)]
+            try:
+                self._s = curl_requests.Session(impersonate=profile)
+                self._s.headers.update({"Accept-Language": "en-US,en;q=0.9",
+                                        "Referer": f"{WIKI}/wiki/Items"})
+                return
+            except Exception:                            # pragma: no cover
+                self._mode = "requests"                  # bad profile name etc.
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": _UAS[attempt % len(_UAS)],
+            "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{WIKI}/wiki/Items",
+        })
+        self._s = s
+
+    def get(self, url: str, *, params=None, tries: int = 3,
+            progress: Optional[ProgressCb] = None):
+        last: Exception | None = None
+        for attempt in range(tries):
+            try:
+                resp = self._s.get(url, params=params, timeout=40)
+                if resp.status_code in (403, 429, 503) and attempt < tries - 1:
+                    if progress:
+                        progress(f"HTTP {resp.status_code} from wiki — retrying "
+                                 f"with a different browser fingerprint ...")
+                    time.sleep(2 * (attempt + 1))
+                    self._make_session(attempt + 1)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except Exception as exc:   # network/TLS layer errors from either backend
+                last = exc
                 time.sleep(2 * (attempt + 1))
-                session.headers["User-Agent"] = _UAS[(attempt + 1) % len(_UAS)]
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as exc:
-            last = exc
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"wiki request failed after {tries} tries: {last}")
+                self._make_session(attempt + 1)
+        raise RuntimeError(f"wiki request failed after {tries} tries: {last}")
+
+
+def _session(ua_index: int = 0) -> _Fetcher:
+    return _Fetcher()
+
+
+def _get(session: _Fetcher, url: str, *, params=None, tries: int = 3,
+         progress: Optional[ProgressCb] = None):
+    return session.get(url, params=params, tries=tries, progress=progress)
 
 
 def _parse_page_html(page: str, session: requests.Session,
