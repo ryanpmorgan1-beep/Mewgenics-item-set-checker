@@ -368,6 +368,28 @@ def original_url_from_thumb(url: str) -> str | None:
     return f"{m.group(1)}/{m.group(2)}"
 
 
+def thumb_url_from_original(url: str, px: int) -> str | None:
+    """Build the on-demand thumbnail URL for a direct file URL.
+
+    The Items table links icons as raw ``.svg`` files (browsers render those
+    natively). MediaWiki's thumb handler rasterizes them to PNG at any size
+    via the predictable path
+    ``/images/a/ab/X.svg`` -> ``/images/thumb/a/ab/X.svg/160px-X.svg.png``.
+    Works for raster originals too (same pattern, no extra ``.png`` suffix).
+    """
+    path = url.split("?")[0]
+    if "/thumb/" in path:
+        return None
+    m = re.match(r"^(.*)/images/((?:[^/]+/)*)([^/]+)$", path)
+    if not m:
+        return None
+    base, mid, fname = m.group(1), m.group(2) or "", m.group(3)
+    suffix = f"{px}px-{fname}"
+    if fname.lower().endswith(".svg"):
+        suffix += ".png"
+    return f"{base}/images/thumb/{mid}{fname}/{suffix}"
+
+
 def _slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "item"
 
@@ -383,9 +405,11 @@ def download_icons(catalog: Catalog, data_dir: str, session,
     """Fetch every item's icon as a raster PNG using plain image GETs.
 
     Candidate URLs per item, first raster wins:
-      1. the item's thumb URL rewritten to ICON_PX (server rasterizes SVGs)
-      2. the thumb URL exactly as scraped from the Items table
-      3. the original full-size file (only when the source isn't an SVG)
+      1. thumb URL rewritten to ICON_PX (when the scraped URL is a thumb)
+      2. constructed on-demand thumb (when the scraped URL is a direct file,
+         which is the norm here — the Items table links raw SVGs)
+      3. the URL exactly as scraped
+      4. the original full-size file (only when the source isn't an SVG)
     """
     icon_dir = os.path.join(data_dir, ICON_DIR)
     os.makedirs(icon_dir, exist_ok=True)
@@ -417,10 +441,14 @@ def download_icons(catalog: Catalog, data_dir: str, session,
         up = upsize_thumb_url(it.icon_url, ICON_PX)
         if up:
             candidates.append(up)
+        built = thumb_url_from_original(it.icon_url, ICON_PX)
+        if built:
+            candidates.append(built)
         candidates.append(it.icon_url)
         orig = original_url_from_thumb(it.icon_url)
         if orig and not src.lower().endswith(".svg"):
             candidates.append(orig)
+        candidates = list(dict.fromkeys(candidates))
 
         data = None
         for u in candidates:

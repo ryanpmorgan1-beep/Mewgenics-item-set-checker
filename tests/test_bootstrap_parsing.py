@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 
 from app.bootstrap import (import_bundle, original_url_from_thumb, parse_items,
                            parse_sets, source_file_from_image_url,
-                           upsize_thumb_url)
+                           thumb_url_from_original, upsize_thumb_url)
 
 ITEMS_HTML = """
 <table class="shuffle__items wikitable sortable mew-sticky-header">
@@ -116,6 +116,21 @@ def test_original_url_from_thumb():
         "https://mewgenics.wiki.gg/images/thumb/a/ab/C.png/40px-C.png"
     ) == "https://mewgenics.wiki.gg/images/a/ab/C.png"
     assert original_url_from_thumb("https://mewgenics.wiki.gg/images/a/ab/C.png") is None
+
+
+def test_thumb_url_from_original():
+    # raw SVG file (the norm on the Items page) -> rasterized PNG thumb
+    assert thumb_url_from_original(
+        "https://mewgenics.wiki.gg/images/a/ab/Peace_Symbol.svg?v=2", 160
+    ) == ("https://mewgenics.wiki.gg/images/thumb/a/ab/Peace_Symbol.svg/"
+          "160px-Peace_Symbol.svg.png")
+    # raster original: same pattern, no extra .png suffix
+    assert thumb_url_from_original(
+        "https://mewgenics.wiki.gg/images/a/ab/Crown.png", 160
+    ) == "https://mewgenics.wiki.gg/images/thumb/a/ab/Crown.png/160px-Crown.png"
+    # already a thumb -> handled by upsize, not this builder
+    assert thumb_url_from_original(
+        "https://mewgenics.wiki.gg/images/thumb/a/ab/X.svg/40px-X.svg.png", 160) is None
 
 
 # --------------------------------------------------------------------------- #
